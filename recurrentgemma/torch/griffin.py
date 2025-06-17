@@ -14,7 +14,7 @@
 # ============================================================================
 """Griffin model."""
 
-from typing import List, Literal, Optional, overload
+from typing import List, Literal, overload
 
 import torch
 from torch import nn
@@ -81,15 +81,25 @@ class Griffin(nn.Module):
         )
         self.final_norm = layers.RMSNorm(width=self.config.width, device=device, dtype=dtype)
 
+        self.attention_modules = self._get_attention_modules()
+
+    def _get_attention_modules(self) -> dict[str, modules.LocalAttentionBlock]:
+        attention_modules: dict[str, modules.LocalAttentionBlock] = {}
+
+        for name, module in self.named_modules():
+            if isinstance(module, modules.LocalAttentionBlock):
+                attention_modules[name] = module
+        return attention_modules
+
     def reset_parameters(self) -> None:
-        """Resets the parameters of the module."""
+        """Reset the parameters of the module."""
         self.embedder.reset_parameters()
         for block in self.blocks:
-            block.reset_parameters()
+            block.reset_parameters()  # type: ignore
         self.final_norm.reset_parameters()
 
     @overload
-    def forward(
+    def forward(  # type: ignore
         self,
         tokens: at.Tokens,
         segment_pos: at.SegmentPos,
@@ -163,7 +173,7 @@ class Griffin(nn.Module):
             block_name = f"blocks.{i}"
             block_cache = None if cache is None else cache[block_name]
             if self.gradient_checkpointing:
-                x, new_cache[block_name] = checkpoint.checkpoint(
+                x, new_cache[block_name] = checkpoint.checkpoint(  # type: ignore
                     block,
                     x,
                     segment_pos,
@@ -190,43 +200,15 @@ class Griffin(nn.Module):
 
         return logits, new_cache
 
-    def set_sparse_attributes(
-        self,
-        k: Optional[int] = None,
-        metric: Optional[str] = None,
-        prefill: Optional[bool] = False,
-    ):
-        # update all attention layers
-        for block in self.blocks:
-            if block.temporal_block_type == common.TemporalBlockType.ATTENTION:
-                block = block.attention_block
-                block.topk_heads = k
-                block.sparsity_metric = metric
-                block.sparsity_prefill = prefill
-
-    def enable_sparsification(self, k: int = 2, metric="l2", prefill: bool = False):
-        """Enable attention head sparsification.
-
-        Specify k value, norm, and if it should be applied during prefill.
-        """
-        self.set_sparse_attributes(k, metric, prefill)
-
-    def disable_sparsification(self):
-        """Disable attention head sparsification."""
-        self.set_sparse_attributes()
-        print("disabled sparsification")
-
     def set_needle_focus(
         self,
         needle_indices: List | None = None,
         needle_scaling: float | None = None,
     ):
         """Set needle index list on all slef-attention layers."""
-        for block in self.blocks:
-            if block.temporal_block_type == common.TemporalBlockType.ATTENTION:
-                block = block.attention_block
-                block.needle_indices = needle_indices
-                block.needle_scaling = needle_scaling
+        for block in self.attention_modules.values():
+            block.needle_indices = needle_indices
+            block.needle_scaling = needle_scaling
 
     def enable_needle_focus(self, needle_indices: List, scaling: float = 1.0):
         """Enable attention weight increase on all heads for specified tokens."""
@@ -241,29 +223,24 @@ class Griffin(nn.Module):
 
         List of heads has to be in form [(layer, head, index), ...]
         """
-        # self.config.manipulated_heads = heads
-        # self.config.attention_value = attention_value
-
         for layer, head, index in heads:
-            block = self.blocks[layer]
-            if block.temporal_block_type == common.TemporalBlockType.ATTENTION:
-                block = block.attention_block
+            super_block = self.blocks[layer]
+            assert isinstance(super_block, modules.ResidualBlock)
+            if super_block.temporal_block_type == common.TemporalBlockType.ATTENTION:
+                block: modules.LocalAttentionBlock = super_block.attention_block
                 if not block.manipulated_heads:
-                    block.manipulated_heads = list()
+                    block.manipulated_heads = []
                 block.manipulated_heads.append(head)
                 if not block.head_to_index:
-                    block.head_to_index = [None for _ in range(self.config.num_heads)]
+                    block.head_to_index = {}
                 block.head_to_index[head] = index
                 block.attention_value = attention_value
-        # print("enabled attention manipulation")
 
     def disable_attention_manipulation(self):
-        for block in self.blocks:
-            if block.temporal_block_type == common.TemporalBlockType.ATTENTION:
-                block = block.attention_block
-                block.manipulated_heads = None
-                block.head_to_index = None
-                block.attention_value = None
+        for block in self.attention_modules.values():
+            block.manipulated_heads = None
+            block.head_to_index = None
+            block.attention_value = None
 
     def init_cache(
         self,

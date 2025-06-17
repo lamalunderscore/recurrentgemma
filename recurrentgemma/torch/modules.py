@@ -21,32 +21,15 @@ import einops
 import torch
 from torch import nn
 
+from recorder import AttentionRecorder
 from recurrentgemma import common
 from recurrentgemma.torch import array_typing as at
 from recurrentgemma.torch import layers
+from recurrentgemma.torch.utils import get_topk, keep_topk
 
 
 _MIN_LOGITS_VALUE = -2.3819763e38  # Set to a large negative number.
 _MAX_WAVELENGTH = 10_000
-
-
-class AttentionRecorder(nn.Module):
-    def __init__(self, record: str = "last"):
-        super().__init__()
-        self.record = record
-        if record == "all":
-            self.data = []
-        elif record == "last":
-            self.data = None
-
-    def forward(self, x):
-        if isinstance(x, torch.Tensor):
-            x = x.detach().cpu()
-        if self.record == "all":
-            self.data.append(x)
-        elif self.record == "last":
-            self.data = x
-        return x
 
 
 def increase_attention_on_needle(
@@ -69,100 +52,12 @@ def increase_attention_on_needle(
                     outdim_max = max_attn[outdim_idx]
                     for needle_idx in needle_indices:
                         if needle_idx < masked_logits.shape[-1]:
-                            masked_logits[batch_idx, head_idx, outdim_idx, needle_idx] = (
-                                outdim_max * scale_factor
-                            )
+                            masked_logits[batch_idx, head_idx, outdim_idx, needle_idx] = outdim_max * scale_factor
                         else:
                             # print("Needle out of attention context")
                             ...
 
     return masked_logits
-
-
-def get_topk(
-    attn_weights,
-    k: int,
-    metric="l2",
-    do_prefill=False,
-    head_mask_recorder: AttentionRecorder = None,
-) -> torch.Tensor | None:
-    """Return topk head indices for each token.
-
-    Uses different metrics as a measure of uniformity. Return topk least-
-    uniform heads for each token.
-
-    Args:
-        attn_weights (_type_): Weight matrix to calculate topk on.
-        k (int): Number of indices to be returned.
-        metric (str, optional): Metric to measure uniformity. Defaults to "l2".
-        do_prefill (bool, optional): If the sparsification should be calculated during the
-            prefill stage. Defaults to False.
-        head_mask_recorder (AttentionRecorder, optional):
-            Recorder object to store attention weights.
-
-    Raises:
-        ValueError: If k is bigger than the number of heads, or k < 0.
-
-    Returns:
-        torch.Tensor | None: Tensor with topk indices for each token, if k != 0 else None
-
-    """
-    num_heads = attn_weights.shape[1]
-    metric_map = {
-        "l2": lambda x: torch.norm(x, p=2, dim=-1),
-        "entropy": lambda x: torch.sum((x + 1e-12) * torch.log2(x + 1e-12), dim=-1),
-    }
-
-    out_len = attn_weights.shape[-2]
-    if not do_prefill and not out_len == 1:
-        k = num_heads  # deactivate sparsification
-
-    if k == 0:
-        return None
-
-    if k > num_heads or k < 0:
-        raise ValueError(f"k ({k}) cannot exceed number of attention heads ({num_heads})")
-    metric_scores = metric_map[metric](attn_weights)
-
-    _, topk_ind = metric_scores.topk(k, dim=1)
-
-    return topk_ind
-
-
-def keep_topk(attn_output, topk: torch.Tensor) -> torch.Tensor:
-    """Mask out indices not mentioned in the topk tensor.
-
-    Args:
-        attn_output (_type_): Matrix to be masked.
-        topk (torch.Tensor): Tensor including to-be-kept head indices for every token.
-
-    Returns:
-        torch.Tensor: Masked version of attn_output.
-
-    """
-    if topk is None:
-        return attn_output * 0.0
-
-    batch_size, sequence_length, num_heads, h = attn_output.shape
-    batch_size, k, sequence_length = topk.shape
-    if k == num_heads:
-        return attn_output
-
-    mask = torch.zeros(
-        batch_size, sequence_length, num_heads, dtype=torch.bool, device=attn_output.device
-    )
-
-    # make dimensions fit mask tensor
-    topk = torch.einsum("bks -> bsk", topk).to(device=attn_output.device)
-
-    # unmask head indices in topk
-    mask.scatter_(
-        dim=2,  # k dimension
-        index=topk,
-        src=torch.ones_like(topk, dtype=torch.bool, device=attn_output.device),
-    )
-    attn_output = attn_output * mask.unsqueeze(dim=-1)
-    return attn_output
 
 
 @at.typed
@@ -459,18 +354,18 @@ class LocalAttentionBlock(nn.Module):
         self.final_w_init_variance_scale = final_w_init_variance_scale
 
         # Dejavu attributes
-        self.topk_heads = None
-        self.sparsity_metric = None
-        self.sparsity_prefill = None
+        self.topk_heads: int | None = None
+        self.sparsity_metric: str | None = None
+        self.sparsity_prefill: bool | None = None
 
         # Attention intervention attributes
-        self.manipulated_heads = None
-        self.head_to_index = None
-        self.attention_value = None
+        self.manipulated_heads: list[int] | None = None
+        self.head_to_index: dict[str, int] | None = None
+        self.attention_value: float | None = None
 
         # needle focus
-        self.needle_indices = None
-        self.needle_scaling = None
+        self.needle_indices: list[int] | None = None
+        self.needle_scaling: float | None = None
 
         # Layers.
         self.proj_q = nn.Linear(
@@ -501,9 +396,7 @@ class LocalAttentionBlock(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.attn_pattern_recorder = AttentionRecorder()
-        self.head_mask_recorder = AttentionRecorder()
-        self.encoded_recorder = AttentionRecorder()
+        self.attention_recorder: AttentionRecorder | None = None
 
         # Initialization.
         self.reset_parameters()
@@ -538,7 +431,7 @@ class LocalAttentionBlock(nn.Module):
         torch.nn.init.normal_(w, mean=0.0, std=std)
 
     @overload
-    def forward(
+    def forward(  # type: ignore
         self,
         x: at.Activations,
         segment_pos: at.SegmentPos,
@@ -600,9 +493,7 @@ class LocalAttentionBlock(nn.Module):
             attn_mask = _compute_cache_mask(t, cache.num_tokens, self.window_size)
 
             if return_cache:
-                new_cache = _update_attention_cache(
-                    no_cache_keys, no_cache_values, segment_pos, cache
-                )
+                new_cache = _update_attention_cache(no_cache_keys, no_cache_values, segment_pos, cache)
             else:
                 new_cache = None
 
@@ -610,9 +501,7 @@ class LocalAttentionBlock(nn.Module):
             attn_mask = _compute_forward_pass_mask(segment_pos, self.window_size)
 
             if return_cache:
-                new_cache = _attention_cache_from_prompt(
-                    keys, values, segment_pos, self.window_size
-                )
+                new_cache = _attention_cache_from_prompt(keys, values, segment_pos, self.window_size)
             else:
                 new_cache = None
 
@@ -623,19 +512,23 @@ class LocalAttentionBlock(nn.Module):
         attn_mask = torch.unsqueeze(attn_mask, dim=1)
 
         masked_logits = torch.where(attn_mask, logits, _MIN_LOGITS_VALUE).type(torch.float32)
+        if self.attention_recorder is not None:
+            self.attention_recorder(masked_logits)
 
         probs = nn.functional.softmax(masked_logits, dim=-1).type_as(x)
+        topk = None
         if self.topk_heads is not None:
-            topk = None
-            if self.topk_heads < self.num_heads:
+            if self.topk_heads is not None:
+                assert self.sparsity_metric is not None
+                assert self.sparsity_prefill is not None
                 topk = get_topk(
                     probs,
                     k=self.topk_heads,
                     metric=self.sparsity_metric,
                     do_prefill=self.sparsity_prefill,
-                    head_mask_recorder=self.head_mask_recorder,
                 )
             if self.needle_indices is not None:
+                assert self.needle_scaling is not None
                 probs = nn.functional.softmax(
                     increase_attention_on_needle(
                         masked_logits,
@@ -647,8 +540,7 @@ class LocalAttentionBlock(nn.Module):
                 ).type_as(x)
         encoded = einops.einsum(probs, values, "b n t s, b s n h -> b t n h")
         if self.topk_heads is not None:
-            if self.topk_heads < self.num_heads:
-                encoded = keep_topk(encoded, topk)
+            encoded = keep_topk(encoded, topk)
 
         encoded = einops.rearrange(encoded, "... n h -> ... (n h)", n=self.num_heads)
 
@@ -765,7 +657,7 @@ class RecurrentBlock(nn.Module):
         torch.nn.init.normal_(w, mean=0.0, std=std)
 
     @overload
-    def forward(
+    def forward(  # type: ignore
         self,
         x: at.Activations,
         segment_pos: at.SegmentPos,
@@ -1020,7 +912,7 @@ class ResidualBlock(nn.Module):
     def reset_parameters(self) -> None:
         """Reset the parameters of the module."""
         self.temporal_pre_norm.reset_parameters()
-        self.temporal_block.reset_parameters()
+        self.temporal_block.reset_parameters()  # type: ignore
         self.channel_pre_norm.reset_parameters()
         self.mlp_block.reset_parameters()
 
@@ -1038,7 +930,7 @@ class ResidualBlock(nn.Module):
                 return self.attention_block
 
     @overload
-    def forward(
+    def forward(  # type: ignore
         self,
         x: at.Activations,
         segment_pos: at.SegmentPos,
@@ -1080,9 +972,7 @@ class ResidualBlock(nn.Module):
         raw_x = x
 
         inputs_normalized = self.temporal_pre_norm(raw_x)
-        x, cache = self.temporal_block(
-            inputs_normalized, segment_pos, cache, return_cache=return_cache
-        )
+        x, cache = self.temporal_block(inputs_normalized, segment_pos, cache, return_cache=return_cache)
 
         residual = x + raw_x
 
@@ -1155,9 +1045,7 @@ class Embedder(nn.Module):
         self.scale_by_sqrt_dim = scale_by_sqrt_dim
 
         # Parameters.
-        self.input_embedding = nn.Parameter(
-            torch.empty([self.vocab_size, self.embed_dim], device=device, dtype=dtype)
-        )
+        self.input_embedding = nn.Parameter(torch.empty([self.vocab_size, self.embed_dim], device=device, dtype=dtype))
 
         # Initialization
         self.reset_parameters()
@@ -1182,6 +1070,4 @@ class Embedder(nn.Module):
     @at.typed
     def decode(self, x: at.Activations) -> at.TokenLogits:
         """Decode an input sequence of activations."""
-        return (x.to(device=self.input_embedding.device) @ self.input_embedding.T).to(
-            device=x.device
-        )
+        return (x.to(device=self.input_embedding.device) @ self.input_embedding.T).to(device=x.device)

@@ -29,12 +29,13 @@ orbax-checkpoint = { version = "0.5.7", optional = true}
 jax = { version = "~0.4.23", optional = true }
 flax = { version = "^0.8.2", optional = true }
 torch = { version = "^2.2.0", optional = true }
+recorder = { version = "^0.1.0", optional = true }
 pytest = { version = "^8.0.0", optional = true }
 
 [tool.poetry.extras]
 full = ["jax", "orbax-checkpoint", "flax", "torch"]
 jax = ["jax", "orbax-checkpoint", "flax"]
-torch = ["torch"]
+torch = ["torch", "recorder"]
 test = ["pytest", "jax", "orbax-checkpoint", "flax", "torch"]
 
 [build-system]
