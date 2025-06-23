@@ -230,7 +230,7 @@ class Sampler:
         echo: bool,
     ) -> SamplingState:
         """Pre-processes the prompt."""
-        factory_kwargs = dict(device=self.device, dtype=torch.int32)
+        factory_kwargs = {"device": self.device, "dtype": torch.int32}
         batch_size, prompt_length = tokens.shape
 
         # Make all positions to end with the corresponding sequence `length - 1`.

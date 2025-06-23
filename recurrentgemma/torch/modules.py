@@ -25,39 +25,11 @@ from recorder import AttentionRecorder
 from recurrentgemma import common
 from recurrentgemma.torch import array_typing as at
 from recurrentgemma.torch import layers
-from recurrentgemma.torch.utils import get_topk, keep_topk
+from recurrentgemma.torch.utils import get_topk, keep_topk, manipulate_weights
 
 
 _MIN_LOGITS_VALUE = -2.3819763e38  # Set to a large negative number.
 _MAX_WAVELENGTH = 10_000
-
-
-def increase_attention_on_needle(
-    masked_logits,
-    topk_indices,
-    needle_indices,
-    scale_factor: float = 1.0,
-    prefill=False,
-):
-    if topk_indices is None:
-        return masked_logits
-
-    batch_size = masked_logits.shape[0]
-    outdim_len = masked_logits.shape[-2]
-    if prefill or outdim_len == 1:
-        for batch_idx in range(batch_size):
-            for head_idx in topk_indices[batch_idx]:
-                max_attn = masked_logits[batch_idx, head_idx].max(dim=-1).values
-                for outdim_idx in range(outdim_len):
-                    outdim_max = max_attn[outdim_idx]
-                    for needle_idx in needle_indices:
-                        if needle_idx < masked_logits.shape[-1]:
-                            masked_logits[batch_idx, head_idx, outdim_idx, needle_idx] = outdim_max * scale_factor
-                        else:
-                            # print("Needle out of attention context")
-                            ...
-
-    return masked_logits
 
 
 @at.typed
@@ -358,14 +330,14 @@ class LocalAttentionBlock(nn.Module):
         self.sparsity_metric: str | None = None
         self.sparsity_prefill: bool | None = None
 
-        # Attention intervention attributes
-        self.manipulated_heads: list[int] | None = None
-        self.head_to_index: dict[str, int] | None = None
-        self.attention_value: float | None = None
+        # Attention weight manipulation
+        self.manipulate_gen_indices: list[int] | None = None
+        self.manipulate_prefill_indices: list[int] | None = None
+        self.manipulate_gen: Literal["ommit", "only", "balanced", "keep"] | None = None
+        self.manipulate_prefill: Literal["ommit", "balanced", "only", "keep", "null"] | None = None
 
-        # needle focus
-        self.needle_indices: list[int] | None = None
-        self.needle_scaling: float | None = None
+        # Attention recorder
+        self.attention_recorder: AttentionRecorder | None = None
 
         # Layers.
         self.proj_q = nn.Linear(
@@ -396,12 +368,9 @@ class LocalAttentionBlock(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.attention_recorder: AttentionRecorder | None = None
 
         # Initialization.
         self.reset_parameters()
-        # For storing attention patterns
-        self.last_attention_weights = None
 
     def reset_parameters(self) -> None:
         """Reset all projection parameters."""
@@ -493,7 +462,9 @@ class LocalAttentionBlock(nn.Module):
             attn_mask = _compute_cache_mask(t, cache.num_tokens, self.window_size)
 
             if return_cache:
-                new_cache = _update_attention_cache(no_cache_keys, no_cache_values, segment_pos, cache)
+                new_cache = _update_attention_cache(
+                    no_cache_keys, no_cache_values, segment_pos, cache
+                )
             else:
                 new_cache = None
 
@@ -501,46 +472,58 @@ class LocalAttentionBlock(nn.Module):
             attn_mask = _compute_forward_pass_mask(segment_pos, self.window_size)
 
             if return_cache:
-                new_cache = _attention_cache_from_prompt(keys, values, segment_pos, self.window_size)
+                new_cache = _attention_cache_from_prompt(
+                    keys, values, segment_pos, self.window_size
+                )
             else:
                 new_cache = None
 
         # Compute attention.
         logits = einops.einsum(queries, keys, "b t n h, b s n h -> b n t s")
         logits = logits * (self.head_dim**-0.5)
+
         # Expand for heads axis.
         attn_mask = torch.unsqueeze(attn_mask, dim=1)
 
         masked_logits = torch.where(attn_mask, logits, _MIN_LOGITS_VALUE).type(torch.float32)
-        if self.attention_recorder is not None:
-            self.attention_recorder(masked_logits)
 
         probs = nn.functional.softmax(masked_logits, dim=-1).type_as(x)
-        topk = None
         if self.topk_heads is not None:
-            if self.topk_heads is not None:
-                assert self.sparsity_metric is not None
-                assert self.sparsity_prefill is not None
-                topk = get_topk(
+            assert isinstance(self.sparsity_metric, str) and isinstance(
+                self.sparsity_prefill, bool
+            ), "Initialization failed."
+            topk = get_topk(
+                probs,
+                k=self.topk_heads,
+                metric=self.sparsity_metric,
+                do_prefill=self.sparsity_prefill,
+            )
+        if self.manipulate_gen_indices is not None:
+            assert self.manipulate_gen is not None
+            if t == 1 and not self.manipulate_gen == "keep":  # during generation
+                assert isinstance(self.manipulate_gen_indices, list)
+                probs = manipulate_weights(
                     probs,
-                    k=self.topk_heads,
-                    metric=self.sparsity_metric,
-                    do_prefill=self.sparsity_prefill,
-                )
-            if self.needle_indices is not None:
-                assert self.needle_scaling is not None
-                probs = nn.functional.softmax(
-                    increase_attention_on_needle(
-                        masked_logits,
-                        topk,
-                        self.needle_indices,
-                        self.needle_scaling,
-                    ),
-                    dim=-1,
+                    (self.manipulate_gen_indices, self.manipulate_gen),
+                    self.window_size,
+                    int(segment_pos[0, -1]),
+                ).type_as(x)
+        if self.manipulate_prefill_indices is not None:
+            assert self.manipulate_prefill is not None
+            if t > 1 and not self.manipulate_prefill == "keep":  # during prefill
+                assert isinstance(self.manipulate_prefill_indices, list)
+                probs = manipulate_weights(
+                    probs,
+                    (self.manipulate_prefill_indices, self.manipulate_prefill),
+                    self.window_size,
+                    int(segment_pos[0, -1]),
                 ).type_as(x)
         encoded = einops.einsum(probs, values, "b n t s, b s n h -> b t n h")
         if self.topk_heads is not None:
             encoded = keep_topk(encoded, topk)
+
+        if self.attention_recorder is not None:
+            self.attention_recorder(probs)
 
         encoded = einops.rearrange(encoded, "... n h -> ... (n h)", n=self.num_heads)
 
@@ -972,7 +955,9 @@ class ResidualBlock(nn.Module):
         raw_x = x
 
         inputs_normalized = self.temporal_pre_norm(raw_x)
-        x, cache = self.temporal_block(inputs_normalized, segment_pos, cache, return_cache=return_cache)
+        x, cache = self.temporal_block(
+            inputs_normalized, segment_pos, cache, return_cache=return_cache
+        )
 
         residual = x + raw_x
 
@@ -1045,7 +1030,9 @@ class Embedder(nn.Module):
         self.scale_by_sqrt_dim = scale_by_sqrt_dim
 
         # Parameters.
-        self.input_embedding = nn.Parameter(torch.empty([self.vocab_size, self.embed_dim], device=device, dtype=dtype))
+        self.input_embedding = nn.Parameter(
+            torch.empty([self.vocab_size, self.embed_dim], device=device, dtype=dtype)
+        )
 
         # Initialization
         self.reset_parameters()
@@ -1070,4 +1057,6 @@ class Embedder(nn.Module):
     @at.typed
     def decode(self, x: at.Activations) -> at.TokenLogits:
         """Decode an input sequence of activations."""
-        return (x.to(device=self.input_embedding.device) @ self.input_embedding.T).to(device=x.device)
+        return (x.to(device=self.input_embedding.device) @ self.input_embedding.T).to(
+            device=x.device
+        )

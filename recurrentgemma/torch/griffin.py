@@ -14,7 +14,7 @@
 # ============================================================================
 """Griffin model."""
 
-from typing import List, Literal, overload
+from typing import Literal, overload
 
 import torch
 from torch import nn
@@ -199,48 +199,6 @@ class Griffin(nn.Module):
             return logits, None
 
         return logits, new_cache
-
-    def set_needle_focus(
-        self,
-        needle_indices: List | None = None,
-        needle_scaling: float | None = None,
-    ):
-        """Set needle index list on all slef-attention layers."""
-        for block in self.attention_modules.values():
-            block.needle_indices = needle_indices
-            block.needle_scaling = needle_scaling
-
-    def enable_needle_focus(self, needle_indices: List, scaling: float = 1.0):
-        """Enable attention weight increase on all heads for specified tokens."""
-        self.set_needle_focus(needle_indices, scaling)
-
-    def disable_needle_focus(self):
-        """Enable attention weight increase on all heads for specified tokens."""
-        self.set_needle_focus()
-
-    def enable_attention_manipulation(self, heads: List, attention_value: float):
-        """Enable attention head manipulation with specified list of heads & sequence indexes and attention value to set.
-
-        List of heads has to be in form [(layer, head, index), ...]
-        """
-        for layer, head, index in heads:
-            super_block = self.blocks[layer]
-            assert isinstance(super_block, modules.ResidualBlock)
-            if super_block.temporal_block_type == common.TemporalBlockType.ATTENTION:
-                block: modules.LocalAttentionBlock = super_block.attention_block
-                if not block.manipulated_heads:
-                    block.manipulated_heads = []
-                block.manipulated_heads.append(head)
-                if not block.head_to_index:
-                    block.head_to_index = {}
-                block.head_to_index[head] = index
-                block.attention_value = attention_value
-
-    def disable_attention_manipulation(self):
-        for block in self.attention_modules.values():
-            block.manipulated_heads = None
-            block.head_to_index = None
-            block.attention_value = None
 
     def init_cache(
         self,

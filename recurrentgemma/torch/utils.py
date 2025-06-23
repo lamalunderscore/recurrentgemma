@@ -1,5 +1,7 @@
 """Utility functions for dejavu implementation."""
 
+from typing import Literal
+
 import torch
 
 
@@ -66,12 +68,14 @@ def keep_topk(attn_output, topk: torch.Tensor | None) -> torch.Tensor:
     if topk is None:
         return attn_output * 0.0
 
-    batch_size, sequence_length, num_heads, h = attn_output.shape
-    batch_size, k, sequence_length = topk.shape
+    batch_size, target_length, num_heads, h = attn_output.shape
+    batch_size, k, target_length = topk.shape
     if k == num_heads:
         return attn_output
 
-    mask = torch.zeros(batch_size, sequence_length, num_heads, dtype=torch.bool, device=attn_output.device)
+    mask = torch.zeros(
+        batch_size, target_length, num_heads, dtype=torch.bool, device=attn_output.device
+    )
 
     # make dimensions fit mask tensor
     topk = torch.einsum("bks -> bsk", topk).to(device=attn_output.device)
@@ -86,4 +90,73 @@ def keep_topk(attn_output, topk: torch.Tensor | None) -> torch.Tensor:
     return attn_output
 
 
-__all__ = ("get_topk", "keep_topk")
+def _init_value_params(
+    token_indices: list[int], mode: Literal["ommit", "only", "balanced", "null"]
+):
+    if mode == "ommit":  # null needle
+        return (0, 1)
+    if mode == "null":  # null everything
+        return (0, 0)
+    if mode == "only":  # keep needle, null rest
+        return (42, 0)  # first value is unused in this case, so I can show that I am a nerd.
+    if mode == "balanced":  # null everything and then set needle to balanced softmax
+        return (1 / len(token_indices), 0)
+
+
+def manipulate_weights(
+    probs: torch.Tensor,
+    manipulation: tuple[list[int], Literal["ommit", "only", "balanced", "null"]],
+    sliding_window_size: int,
+    sequence_length: int,
+):
+    """Manipulate attention weights in different modes.
+
+    Args:
+        probs (torch.Tensor): The original softmax tensor.
+        manipulation (tuple[list[int], Literal["ommit", "only", "balanced"]]):
+            Tokens and modes to manipulate by.
+            Gen modes:
+            "Ommit": set specified tokens to 0.
+            "Only": set every token but the specified tokens to 0.
+            "balanced": set every token to 0 and calculate balanced weights on the specified tokens.
+            Prefill modes:
+            "Ommit": set all values to 0.
+            "manipulate": follow gen mode.
+            "keep": do not manipulate.
+        sliding_window_size (int): Sliding window size of the model.
+        sequence_length (int): Length of the input sequence. Necessary to compute position in circular buffer.
+        prefill (bool, optional): Mode that prefill should be handled with.
+
+    Returns:
+        torch.Tensor: The manipulated sotmax tensor.
+
+    """
+    batch_size, num_heads, target_length, num_weights = probs.shape
+    assert batch_size == 1, "Attention weight manipulation only works with batch_size = 1"
+    assert isinstance(sequence_length, int)
+
+    token_indices, mode = manipulation
+    if target_length == 1:  # there is no sliding window during prefill
+        token_indices = [
+            token_index % sliding_window_size  # RG uses a circular cache buffer
+            for token_index in token_indices
+            if token_index >= sequence_length - sliding_window_size
+        ]
+    probs_manipulated = probs.clone()
+
+    token_value, non_token_weight = _init_value_params(token_indices, mode)
+
+    for weight_index in range(num_weights):
+        if weight_index in token_indices and mode in [  # only change token weights in these modes
+            "balanced",
+            "ommit",
+            "null",
+        ]:
+            probs_manipulated[..., weight_index] = token_value
+        if weight_index not in token_indices:
+            probs_manipulated[..., weight_index] *= non_token_weight
+
+    return probs_manipulated
+
+
+__all__ = ("get_topk", "keep_topk", "manipulate_weights")
