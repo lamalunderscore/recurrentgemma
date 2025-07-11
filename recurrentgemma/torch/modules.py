@@ -21,7 +21,7 @@ import einops
 import torch
 from torch import nn
 
-from recorder import AttentionRecorder
+from recorder import TensorRecorder
 from recurrentgemma import common
 from recurrentgemma.torch import array_typing as at
 from recurrentgemma.torch import layers
@@ -333,11 +333,11 @@ class LocalAttentionBlock(nn.Module):
         # Attention weight manipulation
         self.manipulate_gen_indices: list[int] | None = None
         self.manipulate_prefill_indices: list[int] | None = None
-        self.manipulate_gen: Literal["ommit", "only", "balanced", "keep"] | None = None
+        self.manipulate_gen: Literal["ommit", "only", "balanced", "keep", "null"] | None = None
         self.manipulate_prefill: Literal["ommit", "balanced", "only", "keep", "null"] | None = None
 
         # Attention recorder
-        self.attention_recorder: AttentionRecorder | None = None
+        self.attention_recorder: TensorRecorder | None = None
 
         # Layers.
         self.proj_q = nn.Linear(

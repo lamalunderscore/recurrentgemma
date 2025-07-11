@@ -22,8 +22,6 @@ def get_topk(
         metric (str, optional): Metric to measure uniformity. Defaults to "l2".
         do_prefill (bool, optional): If the sparsification should be calculated during the
             prefill stage. Defaults to False.
-        head_mask_recorder (AttentionRecorder, optional):
-            Recorder object to store attention weights.
 
     Raises:
         ValueError: If k is bigger than the number of heads, or k < 0.
@@ -91,7 +89,7 @@ def keep_topk(attn_output, topk: torch.Tensor | None) -> torch.Tensor:
 
 
 def _init_value_params(
-    token_indices: list[int], mode: Literal["ommit", "only", "balanced", "null"]
+    token_indices: list[int], mode: Literal["ommit", "only", "balanced", "null"], probs
 ):
     if mode == "ommit":  # null needle
         return (0, 1)
@@ -100,7 +98,9 @@ def _init_value_params(
     if mode == "only":  # keep needle, null rest
         return (42, 0)  # first value is unused in this case, so I can show that I am a nerd.
     if mode == "balanced":  # null everything and then set needle to balanced softmax
-        return (1 / len(token_indices), 0)
+        batch_size, num_heads, target_length, num_weights = probs.shape
+        balanced_value = probs[..., token_indices].sum() / num_heads / len(token_indices)
+        return (balanced_value, 0)
 
 
 def manipulate_weights(
@@ -135,6 +135,8 @@ def manipulate_weights(
     assert batch_size == 1, "Attention weight manipulation only works with batch_size = 1"
     assert isinstance(sequence_length, int)
 
+    probs_manipulated = probs.clone()
+
     token_indices, mode = manipulation
     if target_length == 1:  # there is no sliding window during prefill
         token_indices = [
@@ -142,9 +144,10 @@ def manipulate_weights(
             for token_index in token_indices
             if token_index >= sequence_length - sliding_window_size
         ]
-    probs_manipulated = probs.clone()
+        if not token_indices:
+            return probs_manipulated
 
-    token_value, non_token_weight = _init_value_params(token_indices, mode)
+    token_value, non_token_weight = _init_value_params(token_indices, mode, probs)
 
     for weight_index in range(num_weights):
         if weight_index in token_indices and mode in [  # only change token weights in these modes
