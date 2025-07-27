@@ -89,9 +89,9 @@ def keep_topk(attn_output, topk: torch.Tensor | None) -> torch.Tensor:
 
 
 def _init_value_params(
-    token_indices: list[int], mode: Literal["ommit", "only", "balanced", "null"], probs
+    token_indices: list[int], mode: Literal["omit", "only", "balanced", "null"], probs
 ):
-    if mode == "ommit":  # null needle
+    if mode == "omit":  # null needle
         return (0, 1)
     if mode == "null":  # null everything
         return (0, 0)
@@ -105,7 +105,7 @@ def _init_value_params(
 
 def manipulate_weights(
     probs: torch.Tensor,
-    manipulation: tuple[list[int], Literal["ommit", "only", "balanced", "null"]],
+    manipulation: tuple[list[int], Literal["omit", "only", "balanced", "null"]],
     sliding_window_size: int,
     sequence_length: int,
 ):
@@ -113,7 +113,7 @@ def manipulate_weights(
 
     Args:
         probs (torch.Tensor): The original softmax tensor.
-        manipulation (tuple[list[int], Literal["ommit", "only", "balanced"]]):
+        manipulation (tuple[list[int], Literal["omit", "only", "balanced"]]):
             Tokens and modes to manipulate by.
             Gen modes:
             "Ommit": set specified tokens to 0.
@@ -152,7 +152,7 @@ def manipulate_weights(
     for weight_index in range(num_weights):
         if weight_index in token_indices and mode in [  # only change token weights in these modes
             "balanced",
-            "ommit",
+            "omit",
             "null",
         ]:
             probs_manipulated[..., weight_index] = token_value

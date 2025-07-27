@@ -333,8 +333,8 @@ class LocalAttentionBlock(nn.Module):
         # Attention weight manipulation
         self.manipulate_gen_indices: list[int] | None = None
         self.manipulate_prefill_indices: list[int] | None = None
-        self.manipulate_gen: Literal["ommit", "only", "balanced", "keep", "null"] | None = None
-        self.manipulate_prefill: Literal["ommit", "balanced", "only", "keep", "null"] | None = None
+        self.manipulate_gen: Literal["omit", "only", "balanced", "keep", "null"] | None = None
+        self.manipulate_prefill: Literal["omit", "balanced", "only", "keep", "null"] | None = None
 
         # Attention recorder
         self.attention_recorder: TensorRecorder | None = None
